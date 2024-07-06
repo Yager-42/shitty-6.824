@@ -136,7 +136,7 @@ func DoReduceTask(reducef func(string, []string) string, t *Task) {
 
 func DoMapTask(mapf func(string, string) []KeyValue, t *Task) {
 	var intermediate []KeyValue
-	fileName := "/home/ruanrui/6.824/src/main/" + t.FileSlice[0]
+	fileName := t.FileSlice[0]
 
 	f, err := os.Open(fileName)
 	if err != nil {

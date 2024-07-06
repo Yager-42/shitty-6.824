@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 import "net"
 import "os"
@@ -18,8 +19,9 @@ var mu sync.Mutex
 
 // TaskMetaInfo 保存任务的元数据
 type TaskMetaInfo struct {
-	state   State // 任务的状态
-	TaskAdr *Task // 传入任务的指针,为的是这个任务从通道中取出来后，还能通过地址标记这个任务已经完成
+	state     State     // 任务的状态
+	StartTime time.Time // 任务的开始时间，为crash做准备
+	TaskAdr   *Task     // 传入任务的指针,为的是这个任务从通道中取出来后，还能通过地址标记这个任务已经完成
 }
 
 // TaskMetaHolder 保存全部任务的元数据
@@ -151,13 +153,14 @@ func selectReduceName(i int) []string {
 	return res
 }
 
-// 判断任务是否正在工作
+// 判断给定任务是否在工作，并修正其目前任务信息状态
 func (t *TaskMetaHolder) isNotWorking(taskId int) bool {
-	taskInfo, fDone := t.MetaMap[taskId]
-	if !fDone || taskInfo.state != Waiting {
+	taskInfo, ok := t.MetaMap[taskId]
+	if !ok || taskInfo.state != Waiting {
 		return false
 	}
 	taskInfo.state = Working
+	taskInfo.StartTime = time.Now()
 	return true
 }
 
@@ -302,6 +305,39 @@ func (c *Coordinator) MarkFinished(args *Task, reply *Task) error {
 	return nil
 }
 
+func (c *Coordinator) CrashDetector() {
+	for {
+		time.Sleep(time.Second * 2)
+		mu.Lock()
+		if c.DistPhase == AllDone {
+			mu.Unlock()
+			break
+		}
+
+		for _, v := range c.taskMetaHolder.MetaMap {
+			if v.state == Working {
+				//fmt.Println("task[", v.TaskAdr.TaskId, "] is working: ", time.Since(v.StartTime), "s")
+			}
+
+			if v.state == Working && time.Since(v.StartTime) > 9*time.Second {
+				fmt.Printf("the task[ %d ] is crash,take [%d] s\n", v.TaskAdr.TaskId, time.Since(v.StartTime))
+
+				switch v.TaskAdr.TaskType {
+				case MapTask:
+					c.TaskChannelMap <- v.TaskAdr
+					v.state = Waiting
+				case ReduceTask:
+					c.TaskChannelReduce <- v.TaskAdr
+					v.state = Waiting
+
+				}
+			}
+		}
+		mu.Unlock()
+	}
+
+}
+
 //
 // create a Coordinator.
 // main/mrcoordinator.go calls this function.
@@ -321,5 +357,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c.makeMapTasks(files)
 
 	c.server()
+
+	go c.CrashDetector()
 	return &c
 }
