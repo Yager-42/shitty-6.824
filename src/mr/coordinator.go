@@ -2,7 +2,10 @@ package mr
 
 import (
 	"fmt"
+	"io/ioutil"
 	"log"
+	"strconv"
+	"strings"
 	"sync"
 )
 import "net"
@@ -100,18 +103,52 @@ func (t *TaskMetaHolder) acceptMeta(taskInfo *TaskMetaInfo) bool {
 	return true
 }
 
-// make a task for each file
+// make a map task for each file
 func (c *Coordinator) makeMapTasks(files []string) {
 	for _, file := range files {
-		task := Task{TaskType: MapTask, TaskId: c.genTaskId(), ReducerNum: c.ReducerNum, Filename: file}
+		task := Task{TaskType: MapTask, TaskId: c.genTaskId(), ReducerNum: c.ReducerNum, FileSlice: []string{file}}
 
-		taskMetaInfo := TaskMetaInfo{state: Waiting, TaskAdr: &Task{}}
+		taskMetaInfo := TaskMetaInfo{state: Waiting, TaskAdr: &task}
 
 		c.taskMetaHolder.acceptMeta(&taskMetaInfo)
 
 		fmt.Println("make a map task :", &task)
 		c.TaskChannelMap <- &task
 	}
+	fmt.Println("1")
+}
+
+// make a reduce task for each file
+func (c *Coordinator) makeReduceTasks() {
+	for i := 0; i < c.ReducerNum; i++ {
+		id := c.genTaskId()
+		task := Task{
+			TaskId:    id,
+			TaskType:  ReduceTask,
+			FileSlice: selectReduceName(i),
+		}
+		// 保存任务的初始状态
+		taskMetaInfo := TaskMetaInfo{
+			state:   Waiting, // 任务等待被执行
+			TaskAdr: &task,   // 保存任务的地址
+		}
+		c.taskMetaHolder.acceptMeta(&taskMetaInfo)
+
+		//fmt.Println("make a reduce task :", &task)
+		c.TaskChannelReduce <- &task
+	}
+}
+
+func selectReduceName(i int) []string {
+	var res []string
+	path, _ := os.Getwd()
+	files, _ := ioutil.ReadDir(path)
+	for _, file := range files {
+		if strings.HasPrefix(file.Name(), "mr-tmp") && strings.HasSuffix(file.Name(), strconv.Itoa(i)) {
+			res = append(res, file.Name())
+		}
+	}
+	return res
 }
 
 // 判断任务是否正在工作
@@ -153,7 +190,7 @@ func (t *TaskMetaHolder) checkTaskDone() bool {
 		return true
 		// reduce -> done
 	} else {
-		if reduceDoneNum > 0 && reduceDoneNum == 0 {
+		if reduceDoneNum > 0 && reduceUnDoneNum == 0 {
 			return true
 		}
 	}
@@ -163,12 +200,13 @@ func (t *TaskMetaHolder) checkTaskDone() bool {
 
 func (c *Coordinator) toNextPhase() {
 	if c.DistPhase == MapPhase {
-		//c.makeReduceTasks()
 
-		// todo
-		c.DistPhase = AllDone
+		c.makeReduceTasks()
+		c.DistPhase = ReducePhase
 	} else if c.DistPhase == ReducePhase {
+
 		c.DistPhase = AllDone
+
 	}
 }
 
@@ -197,9 +235,31 @@ func (c *Coordinator) PollTask(args *TaskArgs, reply *Task) error {
 				return nil
 			}
 		}
-	default:
+	case ReducePhase:
+		{
+			if len(c.TaskChannelReduce) > 0 {
+				*reply = *<-c.TaskChannelReduce
+
+				if !c.taskMetaHolder.isNotWorking(reply.TaskId) {
+					fmt.Printf("taskid[ %d ] is running\n", reply.TaskId)
+					break
+				}
+			} else {
+				reply.TaskType = WaittingTask
+				// 检查任务是否完成，如果完成进入下一个阶段
+				if c.taskMetaHolder.checkTaskDone() {
+					c.toNextPhase()
+				}
+				return nil
+			}
+		}
+	case AllDone:
 		{
 			reply.TaskType = ExitTask
+		}
+	default:
+		{
+			panic("The phase undefined ! ! !")
 		}
 	}
 
@@ -220,6 +280,19 @@ func (c *Coordinator) MarkFinished(args *Task, reply *Task) error {
 				fmt.Printf("Map task Id[%d] is finished.\n", args.TaskId)
 			} else {
 				fmt.Printf("Map task Id[%d] is finished,already ! ! !\n", args.TaskId)
+			}
+			break
+		}
+	case ReduceTask:
+		{
+			meta, ok := c.taskMetaHolder.MetaMap[args.TaskId]
+
+			//prevent a duplicated work which returned from another worker
+			if ok && meta.state == Working {
+				meta.state = Done
+				fmt.Printf("Reduce task Id[%d] is finished.\n", args.TaskId)
+			} else {
+				fmt.Printf("Reduce task Id[%d] is finished,already ! ! !\n", args.TaskId)
 			}
 			break
 		}

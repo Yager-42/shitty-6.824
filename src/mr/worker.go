@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"sort"
 	"strconv"
 	"time"
 )
@@ -55,6 +56,11 @@ func Worker(mapf func(string, string) []KeyValue,
 				fmt.Println("All tasks are in progress, please wait...")
 				time.Sleep(time.Second)
 			}
+		case ReduceTask:
+			{
+				DoReduceTask(reducef, &task)
+				callDone(&task)
+			}
 		case ExitTask:
 			{
 				fmt.Println("Task about :[", task.TaskId, "] is terminated...")
@@ -66,9 +72,71 @@ func Worker(mapf func(string, string) []KeyValue,
 
 }
 
+type SortedKey []KeyValue
+
+// Len 重写len,swap,less才能排序
+func (k SortedKey) Len() int           { return len(k) }
+func (k SortedKey) Swap(i, j int)      { k[i], k[j] = k[j], k[i] }
+func (k SortedKey) Less(i, j int) bool { return k[i].Key < k[j].Key }
+
+//
+
+func shuffle(files []string) []KeyValue {
+	var kva []KeyValue
+
+	for _, filepath := range files {
+		file, _ := os.Open(filepath)
+		dec := json.NewDecoder(file)
+
+		for {
+			var kv KeyValue
+
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+
+			kva = append(kva, kv)
+		}
+		file.Close()
+	}
+
+	sort.Sort(SortedKey(kva))
+	return kva
+}
+
+func DoReduceTask(reducef func(string, []string) string, t *Task) {
+	reduceFileNum := t.TaskId
+	intermediate := shuffle(t.FileSlice)
+	dir, _ := os.Getwd()
+	//tempFile, err := ioutil.TempFile(dir, "mr-tmp-*")
+	tempFile, err := ioutil.TempFile(dir, "mr-tmp-*")
+	if err != nil {
+		log.Fatal("Failed to create temp file", err)
+	}
+	i := 0
+	for i < len(intermediate) {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+		var values []string
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+		output := reducef(intermediate[i].Key, values)
+		fmt.Fprintf(tempFile, "%v %v\n", intermediate[i].Key, output)
+		i = j
+	}
+	tempFile.Close()
+
+	// 在完全写入后进行重命名
+	fn := fmt.Sprintf("mr-out-%d", reduceFileNum)
+	os.Rename(tempFile.Name(), fn)
+}
+
 func DoMapTask(mapf func(string, string) []KeyValue, t *Task) {
 	var intermediate []KeyValue
-	fileName := "/home/ruanrui/6.824/src/main/" + t.Filename
+	fileName := "/home/ruanrui/6.824/src/main/" + t.FileSlice[0]
 
 	f, err := os.Open(fileName)
 	if err != nil {

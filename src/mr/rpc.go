@@ -41,7 +41,7 @@ type Task struct {
 	TaskType   TaskType // 任务类型判断到底是map还是reduce
 	TaskId     int      // 任务的id
 	ReducerNum int      // 传入的reducer的数量，用于hash
-	Filename   string   // 输入文件
+	FileSlice  []string // 输入文件的切片，map一个文件对应一个文件，reduce是对应多个temp中间值文件
 }
 
 // TaskArgs rpc应该传入的参数，可实际上应该什么都不用传,因为只是worker获取一个任务
