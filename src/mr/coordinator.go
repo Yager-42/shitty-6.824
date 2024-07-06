@@ -1,15 +1,38 @@
 package mr
 
-import "log"
+import (
+	"fmt"
+	"log"
+	"sync"
+)
 import "net"
 import "os"
 import "net/rpc"
 import "net/http"
 
+// global lock for worker access task
+var mu sync.Mutex
+
+// TaskMetaInfo 保存任务的元数据
+type TaskMetaInfo struct {
+	state   State // 任务的状态
+	TaskAdr *Task // 传入任务的指针,为的是这个任务从通道中取出来后，还能通过地址标记这个任务已经完成
+}
+
+// TaskMetaHolder 保存全部任务的元数据
+type TaskMetaHolder struct {
+	MetaMap map[int]*TaskMetaInfo // 通过下标hash快速定位
+}
 
 type Coordinator struct {
 	// Your definitions here.
-
+	ReducerNum        int            // 传入的参数决定需要多少个reducer
+	TaskId            int            // 用于生成task的特殊id
+	DistPhase         Phase          // 目前整个框架应该处于什么任务阶段
+	TaskChannelReduce chan *Task     // 使用chan保证并发安全
+	TaskChannelMap    chan *Task     // 使用chan保证并发安全
+	taskMetaHolder    TaskMetaHolder // 存着task
+	files             []string       // 传入的文件数组
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -23,7 +46,6 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 	reply.Y = args.X + 1
 	return nil
 }
-
 
 //
 // start a thread that listens for RPCs from worker.go
@@ -45,13 +67,166 @@ func (c *Coordinator) server() {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 //
+//Done 主函数mr调用，如果所有task完成mr会通过此方法退出
 func (c *Coordinator) Done() bool {
-	ret := false
+	mu.Lock()
+	defer mu.Unlock()
+	if c.DistPhase == AllDone {
+		fmt.Printf("All tasks are finished,the coordinator will be exit! !")
+		return true
+	} else {
+		return false
+	}
 
-	// Your code here.
+}
 
+// 自增 task id
+func (c *Coordinator) genTaskId() int {
+	res := c.TaskId
+	c.TaskId++
+	return res
+}
 
-	return ret
+// push taskInfo if not in TaskMetaHolder
+func (t *TaskMetaHolder) acceptMeta(taskInfo *TaskMetaInfo) bool {
+	taskId := taskInfo.TaskAdr.TaskId
+	meta, _ := t.MetaMap[taskId]
+	if meta != nil {
+		fmt.Println("meta contains task which id = ", taskId)
+		return false
+	} else {
+		t.MetaMap[taskId] = taskInfo
+	}
+	return true
+}
+
+// make a task for each file
+func (c *Coordinator) makeMapTasks(files []string) {
+	for _, file := range files {
+		task := Task{TaskType: MapTask, TaskId: c.genTaskId(), ReducerNum: c.ReducerNum, Filename: file}
+
+		taskMetaInfo := TaskMetaInfo{state: Waiting, TaskAdr: &Task{}}
+
+		c.taskMetaHolder.acceptMeta(&taskMetaInfo)
+
+		fmt.Println("make a map task :", &task)
+		c.TaskChannelMap <- &task
+	}
+}
+
+// 判断任务是否正在工作
+func (t *TaskMetaHolder) isNotWorking(taskId int) bool {
+	taskInfo, fDone := t.MetaMap[taskId]
+	if !fDone || taskInfo.state != Waiting {
+		return false
+	}
+	taskInfo.state = Working
+	return true
+}
+
+// 任务是否完成并且可以进入下一阶段
+func (t *TaskMetaHolder) checkTaskDone() bool {
+	var (
+		mapDoneNum      = 0
+		mapUnDoneNum    = 0
+		reduceDoneNum   = 0
+		reduceUnDoneNum = 0
+	)
+
+	for _, task := range t.MetaMap {
+		if task.TaskAdr.TaskType == MapTask {
+			if task.state == Done {
+				mapDoneNum++
+			} else {
+				mapUnDoneNum++
+			}
+		} else if task.TaskAdr.TaskType == ReduceTask {
+			if task.state == Done {
+				reduceDoneNum++
+			} else {
+				reduceUnDoneNum++
+			}
+		}
+	}
+	// map -> reduce
+	if (mapDoneNum > 0 && mapUnDoneNum == 0) && (reduceDoneNum == 0 && reduceUnDoneNum == 0) {
+		return true
+		// reduce -> done
+	} else {
+		if reduceDoneNum > 0 && reduceDoneNum == 0 {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (c *Coordinator) toNextPhase() {
+	if c.DistPhase == MapPhase {
+		//c.makeReduceTasks()
+
+		// todo
+		c.DistPhase = AllDone
+	} else if c.DistPhase == ReducePhase {
+		c.DistPhase = AllDone
+	}
+}
+
+// assign task
+func (c *Coordinator) PollTask(args *TaskArgs, reply *Task) error {
+	mu.Lock()
+	defer mu.Unlock()
+
+	switch c.DistPhase {
+	case MapPhase:
+		{
+			// 如果存在任务就分发任务
+			if len(c.TaskChannelMap) > 0 {
+				*reply = *<-c.TaskChannelMap
+
+				if !c.taskMetaHolder.isNotWorking(reply.TaskId) {
+					fmt.Printf("taskid[ %d ] is running\n", reply.TaskId)
+					break
+				}
+			} else {
+				reply.TaskType = WaittingTask
+				// 检查任务是否完成，如果完成进入下一个阶段
+				if c.taskMetaHolder.checkTaskDone() {
+					c.toNextPhase()
+				}
+				return nil
+			}
+		}
+	default:
+		{
+			reply.TaskType = ExitTask
+		}
+	}
+
+	return nil
+}
+
+// worker 向 Coordinator表明任务已经完成
+func (c *Coordinator) MarkFinished(args *Task, reply *Task) error {
+	mu.Lock()
+	defer mu.Unlock()
+	switch args.TaskType {
+	case MapTask:
+		{
+			meta, fDone := c.taskMetaHolder.MetaMap[args.TaskId]
+
+			if fDone && meta.state == Working {
+				meta.state = Done
+				fmt.Printf("Map task Id[%d] is finished.\n", args.TaskId)
+			} else {
+				fmt.Printf("Map task Id[%d] is finished,already ! ! !\n", args.TaskId)
+			}
+			break
+		}
+	default:
+		panic("The task type undefined ! ! !")
+	}
+	return nil
 }
 
 //
@@ -60,10 +235,17 @@ func (c *Coordinator) Done() bool {
 // nReduce is the number of reduce tasks to use.
 //
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
-	c := Coordinator{}
-
-	// Your code here.
-
+	c := Coordinator{
+		files:             files,
+		ReducerNum:        nReduce,
+		DistPhase:         MapPhase,
+		TaskChannelMap:    make(chan *Task, len(files)),
+		TaskChannelReduce: make(chan *Task, nReduce),
+		taskMetaHolder: TaskMetaHolder{
+			MetaMap: make(map[int]*TaskMetaInfo, len(files)+nReduce), // 任务的总数应该是files + Reducer的数量
+		},
+	}
+	c.makeMapTasks(files)
 
 	c.server()
 	return &c
