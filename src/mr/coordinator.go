@@ -153,17 +153,6 @@ func selectReduceName(i int) []string {
 	return res
 }
 
-// 判断给定任务是否在工作，并修正其目前任务信息状态
-func (t *TaskMetaHolder) isNotWorking(taskId int) bool {
-	taskInfo, ok := t.MetaMap[taskId]
-	if !ok || taskInfo.state != Waiting {
-		return false
-	}
-	taskInfo.state = Working
-	taskInfo.StartTime = time.Now()
-	return true
-}
-
 // 任务是否完成并且可以进入下一阶段
 func (t *TaskMetaHolder) checkTaskDone() bool {
 	var (
@@ -223,12 +212,13 @@ func (c *Coordinator) PollTask(args *TaskArgs, reply *Task) error {
 		{
 			// 如果存在任务就分发任务
 			if len(c.TaskChannelMap) > 0 {
+
 				*reply = *<-c.TaskChannelMap
 
-				if !c.taskMetaHolder.isNotWorking(reply.TaskId) {
-					fmt.Printf("taskid[ %d ] is running\n", reply.TaskId)
-					break
-				}
+				taskInfo, _ := c.taskMetaHolder.MetaMap[reply.TaskId]
+				taskInfo.state = Working
+				taskInfo.StartTime = time.Now()
+
 			} else {
 				reply.TaskType = WaittingTask
 				// 检查任务是否完成，如果完成进入下一个阶段
@@ -243,10 +233,10 @@ func (c *Coordinator) PollTask(args *TaskArgs, reply *Task) error {
 			if len(c.TaskChannelReduce) > 0 {
 				*reply = *<-c.TaskChannelReduce
 
-				if !c.taskMetaHolder.isNotWorking(reply.TaskId) {
-					fmt.Printf("taskid[ %d ] is running\n", reply.TaskId)
-					break
-				}
+				taskInfo, _ := c.taskMetaHolder.MetaMap[reply.TaskId]
+				taskInfo.state = Working
+				taskInfo.StartTime = time.Now()
+
 			} else {
 				reply.TaskType = WaittingTask
 				// 检查任务是否完成，如果完成进入下一个阶段
